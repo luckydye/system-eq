@@ -97,22 +97,81 @@ fn snr_matches_theory() {
 fn cuts_peak_above_rolled_off_bass() {
     // Shaped like a real small-speaker measurement: bass 15-40 dB under the midrange below ~110 Hz,
     // a +3.5 dB resonance at 126 Hz, and noisy bins under 45 Hz. The old cost found nothing to cut.
-    let frequencies = dsp::log_grid(25.0, 16_000.0, 2_f64.powf(1.0 / 24.0));
+    let frequencies = dsp::analysis_grid();
     let response = frequencies.iter().map(|&f| {
         let rolloff = -15.0 / (1.0 + (f / 95.0).powi(12)) - 25.0 / (1.0 + (f / 40.0).powi(8));
         rolloff + 3.5 * (-((f / 126.0).ln() / 0.06).powi(2)).exp()
     }).collect();
     let snr = frequencies.iter().map(|&f| if f < 45.0 { 5.0 } else { 35.0 }).collect();
-    let mut m = dsp::Measurement { sample_rate: RATE, frequencies, response, snr, peak_db: -20.0, noise_db: -66.0, filters: vec![] };
+    let mut m = dsp::Measurement { sample_rate: RATE, frequencies, response, snr, peak_db: -20.0, noise_db: -66.0, filters: vec![], range: None };
     dsp::fit(&mut m);
     m.validate().unwrap();
-    assert!(m.filters.iter().any(|f| (115.0..140.0).contains(&f.frequency)), "cut the 126 Hz resonance: {:?}", m.filters);
+    assert!(m.filters.iter().any(|f| (115.0..140.0).contains(&f.frequency) && f.gain < 0.0), "cut the 126 Hz resonance: {:?}", m.filters);
     let at = nearest(&m, 126.0);
     assert!(m.response[at] + m.correction(m.frequencies[at]) < 2.5, "resonance reduced");
-    let low = nearest(&m, 35.0);
-    assert!(m.correction(m.frequencies[low]) > -0.5, "no cuts in the noisy region");
-    let notes = m.fit_notes().join(" ");
-    assert!(notes.contains("background noise") && notes.contains("below the midrange"), "explains limits: {notes}");
+    let (low, _) = m.range.unwrap();
+    assert!((85.0..=115.0).contains(&low), "fit range starts where the bass rolls off: {low}");
+    for f in [30.0, 50.0, 70.0] { assert!(m.correction(f) < 1.0, "never boosts the roll-off at {f} Hz"); }
+    assert!(m.fit_notes().join(" ").contains("usable range"));
+}
+
+#[test]
+fn full_range_fit_toward_flat() {
+    // Speaker-like: rolls off under 45 Hz and over 14 kHz, room peak at 80 Hz, broad dip around 2 kHz.
+    let frequencies = dsp::analysis_grid();
+    let response = frequencies.iter().map(|&f| {
+        let lows = -30.0 / (1.0 + (f / 45.0).powi(6));
+        let highs = -30.0 / (1.0 + (14_000.0 / f).powi(6));
+        lows + highs + 7.0 * (-((f / 80.0).ln() / 0.12).powi(2)).exp() - 4.0 * (-((f / 2000.0).ln() / 0.35).powi(2)).exp()
+    }).collect();
+    let mut m = dsp::Measurement { sample_rate: RATE, snr: vec![40.0; 0].into_iter().chain(std::iter::repeat_n(40.0, dsp::analysis_grid().len())).collect(),
+        frequencies, response, peak_db: -20.0, noise_db: -70.0, filters: vec![], range: None };
+    dsp::fit(&mut m);
+    m.validate().unwrap();
+    let (low, high) = m.range.unwrap();
+    assert!((35.0..60.0).contains(&low) && (11_000.0..17_000.0).contains(&high), "speaker range {low}-{high}");
+    let smoothed = m.smoothed();
+    let residual = |f: f64| { let i = nearest(&m, f); smoothed[i] + m.correction(m.frequencies[i]) };
+    assert!(residual(80.0).abs() < 1.5, "room peak corrected: {}", residual(80.0));
+    assert!(residual(2000.0).abs() < 1.5, "dip raised: {}", residual(2000.0));
+    assert!(m.filters.iter().any(|f| f.gain > 0.0 && (1200.0..3500.0).contains(&f.frequency)), "boosts the dip: {:?}", m.filters);
+    assert!(m.filters.iter().all(|f| f.gain <= dsp::MAX_BOOST && (f.gain <= 0.0 || f.q <= 2.0)), "boosts are broad and limited");
+    assert!(m.correction(25.0) < 1.0 && m.correction(18_000.0) < 1.0, "never boosts outside the speaker's range");
+}
+
+#[test]
+fn position_average_smooths_comb_filtering() {
+    let frequencies = dsp::analysis_grid();
+    let position = |shift: f64| {
+        let response: Vec<f64> = frequencies.iter().map(|&f| 6.0 * (f.ln() * 9.0 + shift).sin()).collect();
+        dsp::Measurement { sample_rate: RATE, frequencies: frequencies.clone(), response, snr: vec![40.0; frequencies.len()],
+            peak_db: -20.0, noise_db: -70.0, filters: vec![], range: None }
+    };
+    let positions: Vec<_> = (0..6).map(|k| position(k as f64 * std::f64::consts::PI / 3.0)).collect();
+    let averaged = dsp::average(&positions.iter().collect::<Vec<_>>()).unwrap();
+    let spread = |r: &[f64]| r.iter().cloned().fold(f64::MIN, f64::max) - r.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(spread(&positions[0].response) > 10.0 && spread(&averaged.response) < 3.0, "position ripple averages out");
+    let smoothed = dsp::smooth(&frequencies, &positions[0].response, |_| 1.0 / 3.0);
+    assert!(spread(&smoothed) < spread(&positions[0].response), "smoothing reduces ripple");
+}
+
+#[test]
+fn soundid_curves_import() {
+    // Minimal .swproj-like byte layout: XML header, then a PEQb part holding two f32 curves.
+    let mut bytes = b"<ProjectHeader>...</ProjectHeader>\r\nPEQb\x03\x00\x00\x02".to_vec();
+    for side in [0.0_f32, 3.0] {
+        bytes.extend_from_slice(&[0x63, 0x01, 0, 0, 7, 0, 0, 0]);
+        let mut f = 20.0_f32;
+        while f <= 22_000.0 { bytes.extend_from_slice(&f.to_le_bytes()); bytes.extend_from_slice(&(side + (f / 1000.0).log10()).to_le_bytes()); f *= 1.02; }
+    }
+    let curves = room_tune::soundid::curves(&bytes).unwrap();
+    assert_eq!(curves.len(), 2);
+    assert!(curves.iter().all(|c| c.len() > 300 && c[0].0 == 20.0));
+    let m = room_tune::soundid::to_measurement(&curves[1]);
+    m.validate().unwrap();
+    let at = nearest(&m, 1000.0);
+    assert!(m.response[at].abs() < 0.5, "normalized to the midrange");
+    assert!(room_tune::soundid::curves(b"not a project").is_err());
 }
 
 #[test]

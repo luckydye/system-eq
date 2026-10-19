@@ -20,8 +20,13 @@ Equalizer APO's installer gives users write access to its config folder. After s
 - **Setup screen (first launch):** pick your speakers and measurement microphone; each has a live level meter. Then install or enable the playback engine. You can come back later via ••• › Devices & engine.
 - **Graph:** shows both speakers at once, left solid and right dashed. You see the measured response, the response with EQ, and the EQ curve, with a live output meter beside it.
 - **EQ switch** (top bar): turns the EQ on or off, so you can compare by ear.
-- **Calibrate room…:** opens a dialog with the mic, input channel, input meter, sweep level, and an optional mic calibration file. Each speaker gets a noise baseline and a 10 s sweep. RoomTune then fits cut-only filters between 30 and 300 Hz, per speaker. If the EQ is on, it is bypassed during the measurement and the new result is applied afterwards.
-- **Room correction chip:** click to switch room correction on or off. Hover to see the fitted filters and why a band wasn't cut, such as low SNR or too little bass to correct.
+- **Measure…:** opens a guided multi-position measurement (1, 3, 5 or 7 mic positions; 5 is the default). A small diagram shows where to place the mic for each position. Each position plays a noise baseline and a 10 s sweep per speaker. The positions are power-averaged, which removes comb-filter detail that exists only at one spot. If the EQ is on, it is bypassed for the session and the new result is applied afterwards.
+- **Correction:** RoomTune corrects each speaker toward a flat target across its **usable range**, the band where the speaker's response is within 6 dB of its midrange level. It never boosts where the speaker rolls off.
+  - Fitting uses the smoothed response: 1/12 octave in the bass, widening to 1/3 octave by 4 kHz.
+  - Up to 16 filters per speaker: cuts down to −12 dB, and boosts up to +6 dB that are broad (Q ≤ 2) and kept away from the range edges.
+  - Peaks are weighted more than dips, so deep notches aren't chased.
+- **Import SoundID measurement…** (menu): reads the averaged, mic-calibrated left/right responses from a SoundID Reference `.swproj` project and fits RoomTune's correction to them.
+- **ROOM** button: switches room correction on or off. Hover to see the fitted filters, the corrected range, and any low-SNR regions left uncorrected. Measurements saved before full-range fitting are re-fitted automatically on start.
 - **Manual EQ:** one shared EQ for both speakers, with up to 16 peak, low-shelf, or high-shelf bands.
   - Add bands with **+ Band** or by double-clicking the graph.
   - Drag a point to change frequency and gain; scroll over it to change Q.
@@ -53,7 +58,8 @@ RoomTune\config-backup-*.txt   Copy of config.txt from before RoomTune changed i
 
 ## Limits
 
-- Room correction covers bass resonances only, measured from a single listening position. Manual EQ covers the full range.
+- Correction targets flat; there is no house curve or tilt yet. Use manual EQ for taste.
+- An uncalibrated microphone's own response stays in the measurement, especially above about 8 kHz. Load the mic's calibration file, or import a SoundID measurement.
 - The "with EQ" curve is a prediction, not a second measurement.
 - **ASIO and WASAPI exclusive-mode playback bypass the engine**, for example DAWs using native drivers and some games.
 - Automatic engine setup supports x64 Windows only. One EQ applies to one output at a time.
@@ -70,7 +76,8 @@ cargo run --release --example levels -- --tone "Analogue 1/2"   # diagnose: is a
 ```
 
 The tests cover:
-- measurement maths and room-correction fitting;
+- measurement maths, position averaging, smoothing, and full-range fitting (speaker-range limits, boost rules);
+- SoundID curve import;
 - filters matching Equalizer APO's biquads;
 - exported frequencies surviving Equalizer APO's parser;
 - EQ export, headroom, and limits;
@@ -92,7 +99,9 @@ The tests cover:
 | `src/dsp.rs` | Sweep, FFT analysis, room-correction fitting |
 | `src/profile.rs` | Room measurement profiles, atomic writes |
 | `src/platform.rs` | UAC, registry & permissions, WinHTTP download, processes |
+| `src/soundid.rs` | SoundID Reference `.swproj` measurement import |
 | `examples/levels.rs` | Diagnostic: output levels and test tone |
+| `examples/fit_report.rs` | Diagnostic: fit a `.roomtune` or `.swproj` measurement and print the result |
 | `tests/core.rs` | Integration tests |
 
 RoomTune is MIT licensed (see `LICENSE.txt`). Equalizer APO is GPLv2. RoomTune downloads the unmodified official installer and interacts with it only through registry entries and its [documented config files](https://sourceforge.net/p/equalizerapo/wiki/Configuration%20reference/).

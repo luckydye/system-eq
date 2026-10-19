@@ -16,9 +16,35 @@ pub struct Profile {
     pub demo: bool,
     pub left: Measurement,
     pub right: Measurement,
+    /// Microphone positions averaged into this measurement.
+    #[serde(default = "one")]
+    pub positions: u32,
 }
 
+fn one() -> u32 { 1 }
+
 impl Profile {
+    /// Builds a profile from per-position (left, right) measurements: power-averaged, then fitted.
+    pub fn from_positions(output_id: String, output_name: String, microphone_name: String, calibration_name: String,
+        positions: &[(Measurement, Measurement)]) -> Result<Self> {
+        let left = crate::dsp::average(&positions.iter().map(|p| &p.0).collect::<Vec<_>>())?;
+        let right = crate::dsp::average(&positions.iter().map(|p| &p.1).collect::<Vec<_>>())?;
+        let mut profile = Self { version: PROFILE_VERSION, output_id, output_name, microphone_name, calibration_name,
+            created_unix: now(), demo: false, left, right, positions: positions.len() as u32 };
+        profile.refit();
+        profile.validate(false)?;
+        Ok(profile)
+    }
+
+    /// Re-fits both speakers' correction with the current algorithm.
+    pub fn refit(&mut self) {
+        crate::dsp::fit(&mut self.left);
+        crate::dsp::fit(&mut self.right);
+    }
+
+    /// Profiles saved before full-range fitting carry no fit range; they get re-fitted on load.
+    pub fn needs_refit(&self) -> bool { !self.demo && (self.left.range.is_none() || self.right.range.is_none()) }
+
     pub fn validate(&self, apply: bool) -> Result<()> {
         ensure!(self.version == PROFILE_VERSION, "Unsupported profile version");
         ensure!(!apply || !self.demo, "Demo data cannot be applied. Run a microphone calibration first");
@@ -44,7 +70,7 @@ impl Profile {
         Self { version: PROFILE_VERSION, output_id: "{00000000-0000-0000-0000-000000000000}".into(),
             output_name: "Simulated stereo speakers".into(), microphone_name: "Synthetic response".into(),
             calibration_name: "Demo only".into(), created_unix: now(), demo: true,
-            left: demo_measurement(65.0), right: demo_measurement(82.0) }
+            left: demo_measurement(65.0), right: demo_measurement(82.0), positions: 1 }
     }
 }
 

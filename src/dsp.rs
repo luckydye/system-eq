@@ -4,9 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::{f64::consts::PI, path::Path};
 
 pub const SWEEP_SECONDS: f64 = 10.0;
-pub const MAX_FILTERS: usize = 8;
-/// Bins below this SNR are too close to background noise to justify a cut.
+pub const MAX_FILTERS: usize = 16;
+/// Bins below this SNR are too close to background noise to correct.
 pub const MIN_SNR: f64 = 15.0;
+/// Correction limits: boosts stay modest (they cost headroom and excite the room), cuts can go deeper.
+pub const MAX_BOOST: f64 = 6.0;
+pub const MAX_CUT: f64 = -12.0;
+/// Response analysis grid.
+pub const GRID_LOW: f64 = 20.0;
+pub const GRID_HIGH: f64 = 18_000.0;
+
+pub fn analysis_grid() -> Vec<f64> { log_grid(GRID_LOW, GRID_HIGH, 2_f64.powf(1.0 / 24.0)) }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Filter {
@@ -50,9 +58,77 @@ pub struct Measurement {
     pub peak_db: f64,
     pub noise_db: f64,
     pub filters: Vec<Filter>,
+    /// Frequency span the correction was fitted over (the speaker's usable range).
+    #[serde(default)]
+    pub range: Option<(f64, f64)>,
+}
+
+/// Fractional-octave smoothing width: fine in the bass, where room modes are narrow and audible,
+/// broader in the treble, where the ear integrates (as in psychoacoustic smoothing).
+pub fn smoothing_octaves(f: f64) -> f64 {
+    let t = ((f / 200.0).log2() / 20_f64.log2()).clamp(0.0, 1.0);
+    1.0 / 12.0 + t * (1.0 / 3.0 - 1.0 / 12.0)
+}
+
+/// Power-domain fractional-octave smoothing of a log-spaced response.
+pub fn smooth(frequencies: &[f64], db: &[f64], octaves: impl Fn(f64) -> f64) -> Vec<f64> {
+    frequencies.iter().map(|&f| {
+        let half = 2_f64.powf(octaves(f) / 2.0);
+        let (sum, count) = frequencies.iter().zip(db).filter(|(x, _)| (f / half..=f * half).contains(*x))
+            .fold((0.0, 0usize), |(s, n), (_, d)| (s + 10_f64.powf(d / 10.0), n + 1));
+        10.0 * (sum / count.max(1) as f64).max(1e-30).log10()
+    }).collect()
+}
+
+fn median_in(frequencies: &[f64], values: &[f64], low: f64, high: f64) -> f64 {
+    let mut v: Vec<f64> = frequencies.iter().zip(values).filter(|(f, _)| (low..=high).contains(*f)).map(|(_, &x)| x).collect();
+    v.sort_by(f64::total_cmp);
+    if v.is_empty() { 0.0 } else { v[v.len() / 2] }
+}
+
+/// Shifts a response so its 500 Hz–2 kHz median sits at 0 dB.
+pub fn normalize(frequencies: &[f64], response: &mut [f64]) {
+    let median = median_in(frequencies, response, 500.0, 2000.0);
+    for r in response { *r -= median; }
+}
+
+/// Power average of several measurements taken on the same grid (multi-position averaging).
+pub fn average(measurements: &[&Measurement]) -> Result<Measurement> {
+    let first = measurements.first().ok_or_else(|| anyhow::anyhow!("No measurements to average"))?;
+    ensure!(measurements.iter().all(|m| m.frequencies == first.frequencies), "Measurements use different frequency grids");
+    let n = measurements.len() as f64;
+    let mut response: Vec<f64> = (0..first.frequencies.len()).map(|i| {
+        10.0 * (measurements.iter().map(|m| 10_f64.powf(m.response[i] / 10.0)).sum::<f64>() / n).log10()
+    }).collect();
+    normalize(&first.frequencies, &mut response);
+    let snr = (0..first.frequencies.len()).map(|i| measurements.iter().map(|m| m.snr[i]).sum::<f64>() / n).collect();
+    Ok(Measurement {
+        sample_rate: first.sample_rate, frequencies: first.frequencies.clone(), response, snr,
+        peak_db: measurements.iter().map(|m| m.peak_db).fold(f64::NEG_INFINITY, f64::max),
+        noise_db: measurements.iter().map(|m| m.noise_db).fold(f64::NEG_INFINITY, f64::max),
+        filters: vec![], range: None,
+    })
 }
 
 impl Measurement {
+    /// The response as used for display and fitting (see [`smoothing_octaves`]).
+    pub fn smoothed(&self) -> Vec<f64> { smooth(&self.frequencies, &self.response, smoothing_octaves) }
+
+    /// The speaker's usable band: where the half-octave-smoothed response stays within 6 dB of
+    /// its midrange level. Boosting outside it only pushes power the speaker cannot reproduce.
+    pub fn speaker_range(&self) -> (f64, f64) {
+        let wide = smooth(&self.frequencies, &self.response, |_| 0.5);
+        let reference = median_in(&self.frequencies, &wide, 300.0, 3000.0);
+        let inside = |i: usize| wide[i] >= reference - 6.0;
+        let f = &self.frequencies;
+        let start = f.partition_point(|&x| x < 200.0).min(f.len() - 1);
+        let mut low = start;
+        while low > 0 && inside(low - 1) { low -= 1; }
+        let start = f.partition_point(|&x| x < 2000.0).min(f.len() - 1);
+        let mut high = start;
+        while high + 1 < f.len() && inside(high + 1) { high += 1; }
+        (f[low].max(GRID_LOW), f[high].min(GRID_HIGH))
+    }
     pub fn correction(&self, f: f64) -> f64 {
         self.filters.iter().map(|x| x.db(f, self.sample_rate)).sum()
     }
@@ -67,34 +143,25 @@ impl Measurement {
         ensure!(self.peak_db.is_finite() && self.noise_db.is_finite(), "Invalid microphone levels");
         ensure!(self.filters.len() <= MAX_FILTERS, "Too many filters");
         for f in &self.filters {
-            ensure!(f.frequency.is_finite() && (30.0..=300.0).contains(&f.frequency)
-                && f.gain.is_finite() && (-9.0..=0.0).contains(&f.gain)
-                && f.q.is_finite() && (0.5..=8.0).contains(&f.q), "Filter exceeds correction limits");
+            ensure!(f.frequency.is_finite() && (GRID_LOW..=20_000.0).contains(&f.frequency)
+                && f.gain.is_finite() && (MAX_CUT..=MAX_BOOST).contains(&f.gain)
+                && f.q.is_finite() && (0.3..=10.0).contains(&f.q), "Filter exceeds correction limits");
         }
-        ensure!(log_grid(20.0, 20_000.0, 1.01).iter().all(|&f| self.correction(f) >= -12.05), "Combined cuts exceed 12 dB");
+        ensure!(log_grid(20.0, 20_000.0, 1.01).iter().all(|&f| (MAX_CUT - 0.05..=MAX_BOOST + 0.05).contains(&self.correction(f))),
+            "Combined correction exceeds -12/+6 dB");
         Ok(())
     }
 
-    /// Plain-language reasons the fit made few or no cuts, for the UI.
+    /// Plain-language notes about the fit, for the UI.
     pub fn fit_notes(&self) -> Vec<String> {
-        let bass: Vec<usize> = (0..self.frequencies.len()).filter(|&i| (30.0..=300.0).contains(&self.frequencies[i])).collect();
         let mut notes = vec![];
-        let noisy = noisy_ranges(&self.frequencies, &self.snr);
-        let noisy_bins = bass.iter().filter(|&&i| self.snr[i] < MIN_SNR).count();
-        if noisy_bins > 0 {
-            let spans: Vec<String> = noisy.iter().filter(|(lo, hi)| *hi >= 30.0 && *lo <= 300.0).map(|(lo, hi)| format!("{lo:.0}–{hi:.0} Hz")).collect();
-            notes.push(format!("Too close to background noise at {}: no cuts there.", spans.join(", ")));
+        if let Some((low, high)) = self.range {
+            notes.push(format!("Corrected {low:.0} Hz – {:.1} kHz, the speaker's usable range.", high / 1000.0));
+            let noisy: Vec<String> = noisy_ranges(&self.frequencies, &self.snr).iter().filter(|(lo, hi)| *hi >= low && *lo <= high)
+                .map(|(lo, hi)| format!("{lo:.0}–{hi:.0} Hz")).collect();
+            if !noisy.is_empty() { notes.push(format!("Too close to background noise at {}: left uncorrected.", noisy.join(", "))); }
         }
-        let mut levels: Vec<f64> = bass.iter().map(|&i| self.response[i]).collect();
-        levels.sort_by(f64::total_cmp);
-        let median = levels[levels.len() / 2];
-        if median < -6.0 {
-            notes.push(format!("Bass sits {:.0} dB below the midrange. Cuts cannot raise it, so they stay shallow.", -median));
-        }
-        if self.filters.is_empty() {
-            let peak = bass.iter().filter(|&&i| self.snr[i] >= MIN_SNR).map(|&i| self.response[i]).fold(f64::NEG_INFINITY, f64::max);
-            if peak.is_finite() { notes.push(format!("Highest bass peak is {peak:+.1} dB: too small to cut without deepening its neighbours.")); }
-        }
+        if self.filters.is_empty() { notes.push("Response is already close to flat.".into()); }
         notes
     }
 }
@@ -198,7 +265,7 @@ pub fn analyze(recording: &[f64], reference: &[f64], noise: &[f64], rate: u32, m
     let rp = power(recording, n); let sp = power(reference, n);
     let window: Vec<_> = noise.iter().enumerate().map(|(i, x)| x * 0.5 * (1.0 - (2.0 * PI * i as f64 / (noise.len() - 1) as f64).cos())).collect();
     let np = power(&window, n);
-    let frequencies = log_grid(25.0, 16_000.0, 2_f64.powf(1.0 / 24.0));
+    let frequencies = analysis_grid();
     let mut response = Vec::with_capacity(frequencies.len());
     let mut snr = Vec::with_capacity(frequencies.len());
     for &f in &frequencies {
@@ -208,69 +275,113 @@ pub fn analyze(recording: &[f64], reference: &[f64], noise: &[f64], rate: u32, m
         response.push(10.0 * (signal / source).log10() - mic.at(f));
         snr.push(10.0 * (signal / background.max(1e-25)).log10());
     }
-    let mut baseline: Vec<f64> = frequencies.iter().zip(&response).filter(|(f, _)| (500.0..=2000.0).contains(*f)).map(|(_, &r)| r).collect();
-    baseline.sort_by(f64::total_cmp);
-    let median = baseline[baseline.len() / 2];
+    normalize(&frequencies, &mut response);
     let mut bass_snr: Vec<f64> = frequencies.iter().zip(&snr).filter(|(f, _)| (40.0..=300.0).contains(*f)).map(|(_, &r)| r).collect();
     bass_snr.sort_by(f64::total_cmp);
     if bass_snr[bass_snr.len() / 2] < 18.0 { bail!("Sweep is too close to background noise. Quiet the room, check the input, or raise the sweep level slightly"); }
     let result = Measurement {
-        sample_rate: rate, frequencies, response: response.iter().map(|x| x - median).collect(), snr,
-        peak_db: 20.0 * peak.log10(), noise_db: 10.0 * (noise.iter().map(|x| x * x).sum::<f64>() / noise.len() as f64).max(1e-20).log10(), filters: vec![],
+        sample_rate: rate, frequencies, response, snr,
+        peak_db: 20.0 * peak.log10(), noise_db: 10.0 * (noise.iter().map(|x| x * x).sum::<f64>() / noise.len() as f64).max(1e-20).log10(),
+        filters: vec![], range: None,
     };
     result.validate()?;
     Ok(result)
 }
 
+/// Perceptual weight of a deviation from target (dB). Peaks are more audible than dips, so they
+/// cost fully; dips cost half, and beyond -3 dB only linearly: a deep notch or roll-off edge that
+/// EQ cannot fill must not stop a nearby resonance from being cut.
+pub fn deviation_cost(e: f64) -> f64 {
+    if e >= 0.0 { e * e } else if e >= -3.0 { 0.5 * e * e } else { 4.5 + 3.0 * (-e - 3.0) }
+}
+
+/// Fits a full-range correction toward a flat target: peaks are cut and dips raised (boosts are
+/// broad and limited), within the speaker's usable range and only where the measurement is
+/// clear of background noise. Works on the smoothed response, so single-position comb-filter
+/// detail is not chased.
 pub fn fit(m: &mut Measurement) {
     m.filters.clear();
-    let mut total = vec![0.0; m.response.len()];
-    let centers = log_grid(30.0, 300.0, 2_f64.powf(1.0 / 12.0));
-    // Peaks cost quadratically and dips three times as much, but only down to -3 dB: below that the
-    // penalty grows linearly. A bass region already far under target (e.g. speaker roll-off) would
-    // otherwise make every cut's skirt so expensive that no resonance is ever cut.
-    let cost = |x: f64| if x >= 0.0 { x * x } else if x >= -3.0 { 3.0 * x * x } else { 24.0 - x };
-    // Cache candidate responses once: the fit performs no repeated trigonometry.
+    let (low, high) = m.speaker_range();
+    m.range = Some((low, high));
+    let target = m.smoothed();
+    let (f, rate, n) = (&m.frequencies, m.sample_rate, m.frequencies.len());
+    let active: Vec<bool> = (0..n).map(|i| (low..=high).contains(&f[i]) && m.snr[i] >= MIN_SNR).collect();
+    if active.iter().filter(|a| **a).count() < 8 { return; }
+    let curve = |flt: &Filter| -> Vec<f64> { f.iter().map(|&x| flt.db(x, rate)).collect() };
+    // No boosting (beyond a 1 dB skirt) outside the fitted range or in noisy bins.
+    let allowed = |i: usize, t: f64| (MAX_CUT..=MAX_BOOST).contains(&t) && (active[i] || t <= 1.0);
+    let cost = |total: &[f64]| -> f64 { (0..n).filter(|&i| active[i]).map(|i| deviation_cost(target[i] + total[i])).sum() };
+    let edge = 2_f64.powf(1.0 / 3.0);
+    let boost_ok = |flt: &Filter| flt.gain <= 0.0 || (flt.q <= 2.0 && flt.frequency >= low * edge && flt.frequency <= high / edge);
+
+    // Candidate bank, computed once.
     let mut candidates = vec![];
-    for &frequency in &centers {
-        for q in [0.7, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] {
-            for gain in [-1.0, -2.0, -3.0, -4.5, -6.0, -9.0] {
-                let filter = Filter { frequency, gain, q };
-                let curve: Vec<_> = m.frequencies.iter().map(|&f| filter.db(f, m.sample_rate)).collect();
-                candidates.push((filter, curve));
+    for &frequency in &log_grid(low, high, 2_f64.powf(1.0 / 12.0)) {
+        for q in [0.5, 0.7, 1.0, 1.4, 2.0, 3.0, 4.5, 6.0] {
+            for gain in [-12.0, -9.0, -6.0, -4.0, -2.5, -1.5, 1.5, 2.5, 4.0, 6.0] {
+                let flt = Filter { frequency, gain, q };
+                if boost_ok(&flt) { candidates.push((curve(&flt), flt)); }
             }
         }
     }
+
+    // Greedy selection: add the filter that lowers the error most, while it still helps clearly.
+    let mut total = vec![0.0; n];
+    let mut curves: Vec<Vec<f64>> = vec![];
+    let mut current = cost(&total);
     for _ in 0..MAX_FILTERS {
-        let mut best = None; let mut best_improvement = 0.25;
-        for (candidate, (_, curve)) in candidates.iter().enumerate() {
-            let mut improvement = 0.0; let mut valid = true;
-            for (i, &cut) in curve.iter().enumerate() {
-                if total[i] + cut < -12.0 { valid = false; break; }
-                if !(30.0..=300.0).contains(&m.frequencies[i]) { continue; }
-                if m.snr[i] < MIN_SNR { if cut < -0.5 { valid = false; break; } continue; }
-                let before = m.response[i] + total[i];
-                improvement += cost(before) - cost(before + cut);
+        let mut best: Option<(usize, f64)> = None;
+        'candidates: for (k, (c, _)) in candidates.iter().enumerate() {
+            let mut trial = 0.0;
+            for i in 0..n {
+                let t = total[i] + c[i];
+                if !allowed(i, t) { continue 'candidates; }
+                if active[i] { trial += deviation_cost(target[i] + t); }
             }
-            if valid && improvement > best_improvement { best = Some(candidate); best_improvement = improvement; }
+            if best.is_none_or(|(_, b)| trial < b) { best = Some((k, trial)); }
         }
-        let Some(best) = best else { break; };
-        m.filters.push(candidates[best].0.clone());
-        for (total, cut) in total.iter_mut().zip(&candidates[best].1) { *total += cut; }
+        // About 1 dB² across a third of an octave: below that a filter is not worth adding.
+        let Some((k, trial)) = best.filter(|(_, trial)| current - trial >= 8.0) else { break; };
+        for (t, c) in total.iter_mut().zip(&candidates[k].0) { *t += c; }
+        curves.push(candidates[k].0.clone());
+        m.filters.push(candidates[k].1.clone());
+        current = trial;
     }
-    // Check between measured bins, where overlapping filters can have deeper minima.
+
+    // Continuous refinement of each filter's frequency, gain and Q.
+    #[allow(clippy::needless_range_loop)] // `j` indexes both the filters and their cached curves
+    for _ in 0..60 {
+        let mut improved = false;
+        for j in 0..m.filters.len() {
+            for (df, dg, dq) in [(1.03, 0.0, 1.0), (1.0 / 1.03, 0.0, 1.0), (1.0, 0.25, 1.0), (1.0, -0.25, 1.0), (1.0, 0.0, 1.12), (1.0, 0.0, 1.0 / 1.12)] {
+                let old = &m.filters[j];
+                let flt = Filter { frequency: (old.frequency * df).clamp(GRID_LOW, 20_000.0), gain: (old.gain + dg).clamp(MAX_CUT, MAX_BOOST), q: (old.q * dq).clamp(0.3, 10.0) };
+                if !boost_ok(&flt) { continue; }
+                let c = curve(&flt);
+                let trial: Vec<f64> = (0..n).map(|i| total[i] - curves[j][i] + c[i]).collect();
+                if !trial.iter().enumerate().all(|(i, &t)| allowed(i, t)) { continue; }
+                let tc = cost(&trial);
+                if tc < current - 1e-6 { current = tc; total = trial; curves[j] = c; m.filters[j] = flt; improved = true; }
+            }
+        }
+        if !improved { break; }
+    }
+    m.filters.retain(|f| f.gain.abs() >= 0.3);
+
+    // Check between measured bins, where overlapping filters can exceed the limits.
     for _ in 0..100 {
-        if log_grid(20.0, 20_000.0, 1.01).iter().all(|&f| m.correction(f) >= -11.95) { break; }
+        if log_grid(20.0, 20_000.0, 1.01).iter().all(|&f| (MAX_CUT + 0.05..=MAX_BOOST - 0.05).contains(&m.correction(f))) { break; }
         for filter in &mut m.filters { filter.gain *= 0.98; }
     }
 }
 
 pub fn demo_measurement(peak: f64) -> Measurement {
-    let frequencies = log_grid(25.0, 16_000.0, 2_f64.powf(1.0 / 24.0));
+    let frequencies = analysis_grid();
     let response = frequencies.iter().map(|f| 8.0 * (-((f / peak).ln() / 0.21).powi(2)).exp()
         + 4.0 * (-((f / 170.0).ln() / 0.16).powi(2)).exp()
-        - 5.0 * (-((f / 115.0).ln() / 0.10).powi(2)).exp() + 0.4 * (f.ln() * 7.0).sin()).collect();
+        - 5.0 * (-((f / 115.0).ln() / 0.10).powi(2)).exp() + 0.4 * (f.ln() * 7.0).sin()
+        - 24.0 * (1.0 - (f / 45.0).min(1.0)).max(0.0) - (f / 12_000.0).max(1.0).log2() * 12.0).collect();
     let mut m = Measurement { sample_rate: 48_000, snr: vec![45.0; frequencies.len()], frequencies,
-        response, peak_db: -18.0, noise_db: -72.0, filters: vec![] };
+        response, peak_db: -18.0, noise_db: -72.0, filters: vec![], range: None };
     fit(&mut m); m
 }

@@ -1,4 +1,4 @@
-use crate::{dsp::{self, Measurement, MicCalibration}, profile::{Profile, PROFILE_VERSION, now}};
+use crate::{dsp::{self, Measurement, MicCalibration}, profile::Profile};
 use anyhow::{Context, Result, bail, ensure};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use serde::Serialize;
@@ -61,19 +61,20 @@ impl Request {
     }
 }
 
-pub fn calibrate(request: &Request, cancel: &Arc<AtomicBool>, progress: &dyn Fn(&str, f32)) -> Result<Profile> {
+/// Measures both speakers at the current microphone position (unfitted).
+pub fn measure_position(request: &Request, cancel: &Arc<AtomicBool>, progress: &dyn Fn(&str, f32)) -> Result<(Measurement, Measurement)> {
     request.validate()?;
     check_cancel(cancel)?;
     let left = measure(request, 0, cancel, progress)?;
     check_cancel(cancel)?;
     let right = measure(request, 1, cancel, progress)?;
-    let mut p = Profile { version: PROFILE_VERSION, output_id: request.output.id.clone(), output_name: request.output.name.clone(),
-        microphone_name: format!("{} / input {}", request.input.name, request.input_channel + 1), calibration_name: request.mic.name.clone(),
-        created_unix: now(), demo: false, left, right };
-    progress("Fitting conservative bass correction", 0.94);
-    dsp::fit(&mut p.left); check_cancel(cancel)?;
-    dsp::fit(&mut p.right); check_cancel(cancel)?;
-    p.validate(false)?; Ok(p)
+    Ok((left, right))
+}
+
+/// Averages all measured positions and fits the correction.
+pub fn build_profile(request: &Request, positions: &[(Measurement, Measurement)]) -> Result<Profile> {
+    Profile::from_positions(request.output.id.clone(), request.output.name.clone(),
+        format!("{} / input {}", request.input.name, request.input_channel + 1), request.mic.name.clone(), positions)
 }
 
 pub fn check_cancel(cancel: &AtomicBool) -> Result<()> {
