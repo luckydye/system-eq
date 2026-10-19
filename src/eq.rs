@@ -105,11 +105,25 @@ pub struct EqConfig {
     pub room_enabled: bool,
     #[serde(default)]
     pub manual: ManualEq,
+    #[serde(default)]
+    pub output_gain: OutputGain,
+}
+
+/// How the shared preamp is chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputGain {
+    /// Cancel the EQ's average loudness change, so switching EQ on/off sounds equally loud.
+    /// Boosted peaks may exceed 0 dBFS on very loud material.
+    #[default]
+    MatchLoudness,
+    /// 1 dB plus the largest boost of headroom: the EQ can never clip.
+    Safe,
 }
 
 impl Default for EqConfig {
     fn default() -> Self {
-        Self { version: EQ_VERSION, output_id: String::new(), output_name: String::new(), room: None, room_enabled: true, manual: ManualEq::default() }
+        Self { version: EQ_VERSION, output_id: String::new(), output_name: String::new(), room: None, room_enabled: true,
+            manual: ManualEq::default(), output_gain: OutputGain::default() }
     }
 }
 
@@ -139,10 +153,30 @@ impl EqConfig {
     }
 
     /// Shared preamp: 1 dB headroom plus the largest boost of either speaker, so EQ cannot clip.
-    pub fn preamp(&self) -> f64 {
-        let peak = log_grid(20.0, 20_000.0, 1.01).iter().flat_map(|&f| [self.response(false, f), self.response(true, f)]).fold(0.0, f64::max);
-        -((1.0 + peak) * 10.0).ceil() / 10.0
+    /// Largest boost of either speaker's EQ (0 if it only cuts).
+    pub fn max_boost(&self) -> f64 {
+        log_grid(20.0, 20_000.0, 1.01).iter().flat_map(|&f| [self.response(false, f), self.response(true, f)]).fold(0.0, f64::max)
     }
+
+    /// Average level change of the EQ across 50 Hz–10 kHz (power average, equal weight per
+    /// octave, both speakers): how much louder (+) or quieter (−) the EQ makes typical music.
+    pub fn loudness_change(&self) -> f64 {
+        let grid = log_grid(50.0, 10_000.0, 2_f64.powf(1.0 / 12.0));
+        let power: f64 = grid.iter().flat_map(|&f| [self.response(false, f), self.response(true, f)]).map(|db| 10_f64.powf(db / 10.0)).sum();
+        10.0 * (power / (2 * grid.len()) as f64).log10()
+    }
+
+    /// The shared preamp, by [`OutputGain`] mode.
+    pub fn preamp(&self) -> f64 {
+        match self.output_gain {
+            OutputGain::Safe => -((1.0 + self.max_boost()) * 10.0).ceil() / 10.0,
+            // `+ 0.0` turns -0.0 into 0.0, so the config never says "Preamp: -0.0 dB".
+            OutputGain::MatchLoudness => (-self.loudness_change() * 10.0).round().clamp(-120.0, 60.0) / 10.0 + 0.0,
+        }
+    }
+
+    /// Highest gain any frequency gets including the preamp; above 0 dB loud material can clip.
+    pub fn peak_gain(&self) -> f64 { self.max_boost() + self.preamp() }
 
     pub fn validate(&self, apply: bool) -> Result<()> {
         ensure!(self.version == EQ_VERSION, "Unsupported RoomTune EQ version");

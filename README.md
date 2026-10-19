@@ -1,5 +1,7 @@
 # RoomTune — room correction & EQ for Windows
 
+![Screenshot](./feature.png)
+
 RoomTune is one app for one-time microphone room calibration and manual EQ. It applies the result to **all Windows playback**, even after you close it.
 
 It is a single native executable (`room-tune.exe`, about 7 MB, Rust + egui). It has no .NET, Electron, browser, account, or background service of its own.

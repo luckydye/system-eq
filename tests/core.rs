@@ -1,6 +1,6 @@
 //! Non-audio tests: no microphone, playback, installer, or system configuration is touched.
 use room_tune::{apo::{self, Operation, Status}, audio::route_frame, dsp::{self, Filter, MicCalibration},
-    engine::{self, Mode, Slot}, eq::{Band, EqConfig, Kind}, profile::{Profile, atomic_write}};
+    engine::{self, Mode, Slot}, eq::{Band, EqConfig, Kind, OutputGain}, profile::{Profile, atomic_write}};
 use std::fs;
 
 const RATE: u32 = 48_000;
@@ -245,20 +245,45 @@ fn exported_frequencies_survive_apo_parsing() {
 
 #[test]
 fn manual_eq_export_and_headroom() {
-    let mut eq = EqConfig::from_profile(test_profile());
+    let mut eq = EqConfig { output_gain: OutputGain::Safe, ..EqConfig::from_profile(test_profile()) };
     eq.manual.left.push(Band { kind: Kind::LowShelf, frequency: 80.0, gain: 4.0, q: 0.7, enabled: true });
     eq.manual.sync();
     let text = apo::export(&eq).unwrap();
     assert_eq!(text.matches("ON LSC Fc 80.00 Hz").count(), 2, "linked band on both speakers");
-    assert!(eq.preamp() <= -4.9, "preamp covers the boost plus 1 dB: {}", eq.preamp());
+    assert!(eq.preamp() <= -4.9, "safe mode: preamp covers the boost plus 1 dB: {}", eq.preamp());
+    assert!(eq.peak_gain() <= -0.9, "safe mode never exceeds 0 dB");
     assert!(text.contains(&format!("Preamp: {:.1} dB", eq.preamp())));
     eq.room_enabled = false;
     assert!(!apo::export(&eq).unwrap().contains(" PK "), "room correction can be switched off");
     eq.manual.left.push(Band::peak(1000.0, 20.0, 1.0));
     assert!(eq.validate(true).is_err(), "reject excessive boost");
     let manual_only = EqConfig { output_id: "{0.0.0.00000000}.{01234567-89ab-cdef-0123-456789abcdef}".into(), ..EqConfig::default() };
-    assert!(apo::export(&manual_only).unwrap().contains("Preamp: -1.0 dB"));
+    assert!(apo::export(&manual_only).unwrap().contains("Preamp: 0.0 dB"), "no EQ, no level change");
     assert!(apo::export(&EqConfig::default()).is_err(), "an output is required");
+}
+
+#[test]
+fn match_loudness_output_gain() {
+    let output_id = "{0.0.0.00000000}.{01234567-89ab-cdef-0123-456789abcdef}".to_string();
+    let mut eq = EqConfig { output_id, ..EqConfig::default() };
+    assert_eq!(eq.output_gain, OutputGain::MatchLoudness, "matching loudness is the default");
+    // A broad 6 dB cut makes music quieter: the preamp pushes the level back up.
+    eq.manual.left.push(Band::peak(300.0, -6.0, 0.7));
+    eq.manual.sync();
+    assert!(eq.loudness_change() < -1.0 && eq.preamp() > 1.0, "gain push: {} dB", eq.preamp());
+    assert!((eq.preamp() + eq.loudness_change()).abs() < 0.06, "preamp cancels the loudness change");
+    // A boost makes music louder: the preamp pulls it back, but far less than safe mode would.
+    eq.manual.left = vec![Band::peak(3000.0, 6.0, 1.4)];
+    eq.manual.sync();
+    let matched = eq.preamp();
+    assert!(matched < 0.0 && matched > -3.0, "partial compensation: {matched}");
+    assert!(eq.peak_gain() > 0.0, "the boosted band can now exceed 0 dBFS (shown as clip risk)");
+    eq.output_gain = OutputGain::Safe;
+    assert!(eq.preamp() <= -6.9 && eq.peak_gain() < 0.0);
+    // Older files without the field load in matching mode.
+    let json = serde_json::to_string(&eq).unwrap().replace(",\"output_gain\":\"Safe\"", "");
+    let loaded: EqConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.output_gain, OutputGain::MatchLoudness);
 }
 
 #[test]
@@ -308,7 +333,8 @@ fn profile_round_trip_and_limits() {
 
 #[test]
 fn export_format() {
-    let text = apo::export(&EqConfig::from_profile(test_profile())).unwrap();
+    let eq = EqConfig::from_profile(test_profile());
+    let text = apo::export(&EqConfig { output_gain: OutputGain::Safe, ..eq }).unwrap();
     assert!(text.contains("Device: {01234567-89ab-cdef-0123-456789abcdef}"));
     assert!(text.contains("Channel: L") && text.contains("Channel: R") && text.contains("Preamp: -1.0 dB"), "cut-only room EQ needs only 1 dB headroom");
     assert!(text.lines().filter(|l| l.starts_with("Filter")).all(|l| !l.contains(',') && l.contains(" ON PK Fc ")));

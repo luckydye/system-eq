@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 use eframe::egui::{self, Align, Align2, Color32, FontFamily, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use room_tune::{apo::{self, Operation, Status}, audio::{self, Devices, Monitor, Tap}, dsp::{Measurement, MicCalibration, log_grid, noisy_ranges}, engine,
-    eq::{self, Band, EqConfig, Kind}, platform, profile::{Profile, atomic_write, data_dir, endpoint_guid}};
+    eq::{self, Band, EqConfig, Kind, OutputGain}, platform, profile::{Profile, atomic_write, data_dir, endpoint_guid}};
 use serde::{Deserialize, Serialize};
 use std::{panic::AssertUnwindSafe, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc}, thread, time::{Duration, Instant}};
 
@@ -185,8 +185,9 @@ impl App {
         if let Some(room) = app.eq.room.as_mut().filter(|r| r.needs_refit()) {
             room.refit();
             app.set_status("Re-fitted your room measurement with full-range correction.");
-            app.mark_dirty();
         }
+        // Re-apply once, so the engine reflects this version's export (e.g. output gain mode).
+        app.mark_dirty();
         app
     }
 
@@ -807,15 +808,19 @@ impl App {
 
         egui::TopBottomPanel::bottom("rack").show_separator_line(false)
             .frame(egui::Frame::new().fill(PANEL).stroke(Stroke::new(1.0, EDGE)).inner_margin(egui::Margin { left: 14, right: 14, top: 10, bottom: 10 })).show(ctx, |ui| {
-            let before = (self.eq.manual.clone(), self.eq.room_enabled);
+            let before = (self.eq.manual.clone(), self.eq.room_enabled, self.eq.output_gain);
             ui.horizontal(|ui| {
                 self.room_section(ui, idle);
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
+                self.output_section(ui);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
                 self.band_section(ui);
             });
-            if (self.eq.manual.clone(), self.eq.room_enabled) != before { self.eq.manual.sync(); self.mark_dirty(); }
+            if (self.eq.manual.clone(), self.eq.room_enabled, self.eq.output_gain) != before { self.eq.manual.sync(); self.mark_dirty(); }
         });
 
         egui::SidePanel::right("meter").exact_width(66.0).resizable(false).show_separator_line(false)
@@ -903,6 +908,39 @@ impl App {
                 }
             });
         });
+    }
+
+    fn output_section(&mut self, ui: &mut egui::Ui) {
+        let preamp = self.eq.preamp();
+        let peak = self.eq.peak_gain();
+        ui.add_enabled_ui(!self.demo(), |ui| ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(caps("Output gain"));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let matching = self.eq.output_gain == OutputGain::MatchLoudness;
+                if hw_button(ui, "MATCH", vec2(68.0, 26.0), Some(AMBER), matching)
+                    .on_hover_text("Keep the EQ as loud as the original: the preamp cancels the EQ's average level change. Boosted peaks may clip on very loud material.")
+                    .clicked() { self.eq.output_gain = OutputGain::MatchLoudness; }
+                if hw_button(ui, "SAFE", vec2(60.0, 26.0), Some(AMBER), !matching)
+                    .on_hover_text("Reserve headroom for every boost so the EQ can never clip. Playback gets quieter by the largest boost.")
+                    .clicked() { self.eq.output_gain = OutputGain::Safe; }
+                ui.add_space(4.0);
+                let (rect, response) = ui.allocate_exact_size(vec2(118.0, 26.0), Sense::hover());
+                well(ui.painter(), rect);
+                let clip = peak > 0.05;
+                ui.painter().text(rect.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, format!("{preamp:+.1} dB"), FontId::monospace(11.5), TEXT);
+                if clip {
+                    led(ui.painter(), pos2(rect.right() - 46.0, rect.center().y), LED_YELLOW, true);
+                    ui.painter().text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, "CLIP", FontId::monospace(10.0), LED_YELLOW);
+                }
+                response.on_hover_text(if clip {
+                    format!("Preamp {preamp:+.1} dB. The most boosted frequency ends {peak:+.1} dB above the input: full-scale material there can clip. Choose SAFE to rule it out.")
+                } else {
+                    format!("Preamp {preamp:+.1} dB. No frequency is raised above the input level: no clipping.")
+                });
+            });
+        }));
     }
 
     fn band_section(&mut self, ui: &mut egui::Ui) {
